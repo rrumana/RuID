@@ -10,8 +10,26 @@ My goals for this project are the following:
   -   Applying techniques like clustering to generate an approximate representation of each individual
   - Scale server program to work with an arbitrary number of clients.
   - Iterate training, quantization, and clustering techniques to achieve better performance.
+  - Explore SIMD NEON optimizations for Raspberry Pi.
   - Containerize for easy deployment.
   - Add features as needed.
+
+# Completion
+I have not even started.
+
+The first bit of this program will be a simple framework for the core functionality; Running a model, capturing and displaying camera input, and smaller features like that.
+
+I will also be exploring CI/CD pipelines for cross-compilation, benchmarking and testing frameworks to assess performance, and other topols to maek this workspace more ergonomic.
+
+This will all come later though, we are starting small.
+
+# Crates to read:
+  - Machine Learning: burn, tflite-rs or onnxruntime-rs depending on which is better at the time.
+  - Image Processing: v4l, image, ndarray
+  - Config + Args: clap, serde, toml
+  - Error Handling: anyhow, thiserror
+  - Logging: log, env_logger, log4rs
+  - Web Server: hypr or warp
 
 # FAQ
 
