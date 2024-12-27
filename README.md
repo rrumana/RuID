@@ -15,13 +15,14 @@ My goals for this project are the following:
   - Add features as needed.
 
 # Completion
-I have not even started.
+I have made a program that takes camera input using libcamera and feeds those frames into Yolov11-nano. Since the Tract runtime is not threaded, I have added a basic threading implementation using some threads and channels. Lots more can be done to optimize this.
 
-The first bit of this program will be a simple framework for the core functionality; Running a model, capturing and displaying camera input, and smaller features like that.
+I am getting about 20FPS on my laptop at about 100% CPU utilization before quantization or any other optiizations. This seems promising, but I am planning on adding support for onnx runtime to comapre. I will add a command line flag to select your runtime, that way I can compare Trace + threading to Onnxruntime. If it turns out that I cannot beat Onnxruntime, I will end up using that.
 
-I will also be exploring CI/CD pipelines for cross-compilation, benchmarking and testing frameworks to assess performance, and other topols to maek this workspace more ergonomic.
+Once I have that figured out I will repeat the process for Resnet-50 and then look into quantization.
 
-This will all come later though, we are starting small.
+# Things that need fixing
+Pretty much everything. I need to look into more efficient ways to do image transformations. Hopefully there is an easy way to do it on the Raspberry Pi GPU. I also need to ensure my model and my camera input match. My laptop camera does not seem to support 640x640 so I am scaling a 1920x1080 image down to 640x640. This is not only inefficient but scaling away from native will hurt visual fidelity and therefore accuracy.
 
 # Crates to read:
   - Machine Learning: burn, tflite-rs or onnxruntime-rs depending on which is better at the time.
