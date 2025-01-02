@@ -1,11 +1,11 @@
 use anyhow::{Error, Result};
 use anyhow::anyhow;
 use clap::Parser;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage, ImageBuffer};
 use imageproc::drawing::draw_hollow_rect_mut;
 use imageproc::rect::Rect;
 use libcamera::{
-    camera::ActiveCamera,
     camera::CameraConfigurationStatus,
     camera_manager::CameraManager,
     framebuffer::AsFrameBuffer,
@@ -14,45 +14,45 @@ use libcamera::{
     geometry::Size,
     pixel_format::PixelFormat,
     properties,
-    request::Request,
     request::ReuseFlag,
-    stream::Stream,
     stream::StreamRole,
 };
+use num_cpus;
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use std::{
+    process,
+    cell::RefCell,
     sync::mpsc, 
     cmp::Ordering,
-    sync::{Arc, Mutex},
     thread,
     time::Duration,
     borrow::Borrow,
     fmt::{Debug, Display},
 };
-use tract_onnx::prelude::*;
-use tract_ndarray::s;
 use sdl2::{
     pixels::PixelFormatEnum,
     rect::Rect as SdlRect,
     render::Canvas,
     video::Window,
 };
-use num_cpus;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use tract_onnx::prelude::*;
+use tract_ndarray::{Array4, s};
 
-// ================ PIPELINE STAGES ================== //
+const PIXEL_FORMAT_MJPEG: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'M', b'J', b'P', b'G']), 0);
 
-/// 0) Parse CLI arguments
 #[derive(Parser)]
 struct CliArgs {
     #[arg(long)]
     weights: String,
 
-    #[arg(long, default_value = "200")]
+    #[arg(long, default_value = "10000")]
     num_frames: usize,
+
+    #[arg(long, default_value = "tract")]
+    engine: String, 
 }
 
-/// 2) Run inference on the frame
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct Bbox {
     pub x1: f32,
     pub y1: f32,
@@ -67,29 +67,39 @@ impl Bbox {
     }
 }
 
-fn run_model<F, O, M>(
+#[derive(Debug, Clone)]
+struct TaggedFrame {
+    seq_id: usize,
+    image: RgbImage,
+} 
+
+fn run_model_tract<F, O, M>(
     model: &RunnableModel<F, O, M>,
-    decoded_image: &DynamicImage
+    decoded_image: DynamicImage
 ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> 
 where
     F: Fact + Clone + 'static,
     O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
     M: Borrow<Graph<F, O>> 
 {
-    let resized = image::imageops::resize(
-        decoded_image,
-        640, 640,
-        image::imageops::FilterType::Triangle,
-    );
-    let dynamic_resized = DynamicImage::from(resized);
-    let rgba = dynamic_resized.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    let image_tensor: Tensor = tract_ndarray::Array4::from_shape_fn((1, 3, h as usize, w as usize), |(_, c, y, x)| {
-        rgba.get_pixel(x as u32, y as u32)[c] as f32 / 255.0
-    })
-    .into();
+    let rgba = decoded_image.to_rgba8();
+    MODEL_SCRATCH.with(|scratch_cell| {
+        let mut scratch = scratch_cell.borrow_mut();
+        for (y, row) in rgba.rows().enumerate() {
+            for (x, pixel) in row.enumerate() {
+                scratch[[0, 0, y, x]] = pixel[0] as f32 / 255.0;
+                scratch[[0, 1, y, x]] = pixel[1] as f32 / 255.0;
+                scratch[[0, 2, y, x]] = pixel[2] as f32 / 255.0;
+            }
+        }
+    });
 
-    let forward = model.run(tvec![image_tensor.to_owned().into()]).unwrap();
+    let image_tensor: Tensor = MODEL_SCRATCH.with(|scratch_cell| {
+        let scratch = scratch_cell.borrow();
+        scratch.to_owned().into()
+    });
+
+    let forward = model.run(tvec![image_tensor.into()]).unwrap();
     let results = forward[0].to_array_view::<f32>().unwrap().view().t().into_owned();
 
     let mut bbox_vec = vec![];
@@ -109,33 +119,36 @@ where
         }
     }
 
-    let final_bboxes = non_maximum_suppression(&mut bbox_vec, 0.5);
+    let final_bboxes = non_maximum_suppression(bbox_vec, 0.5);
 
-    let mut annotated = dynamic_resized.to_rgb8();
+    let mut annotated = decoded_image.into_rgb8();
     draw_bboxes_on_image(&mut annotated, &final_bboxes);
 
     Ok(annotated)
 }
 
-
-/// 3) Cull extra bounding boxes and Annotate the frame in-place
-
-pub fn non_maximum_suppression(boxes: &mut Vec<Bbox>, iou_threshold: f32) -> Vec<Bbox> {
-    boxes.sort_by(|a, b| {
+pub fn non_maximum_suppression(mut boxes: Vec<Bbox>, iou_threshold: f32) -> Vec<Bbox> {
+    boxes.sort_unstable_by(|a, b| {
         b.confidence
             .partial_cmp(&a.confidence)
             .unwrap_or(Ordering::Equal)
     });
 
-    let mut keep = Vec::new();
-    while !boxes.is_empty() {
-        let current = boxes.remove(0);
-        keep.push(current.clone());
-        boxes.retain(|other| calculate_iou(&current, other) <= iou_threshold);
+    let mut keep = Vec::with_capacity(boxes.len());
+
+    'candidate: for current_box in boxes {
+        for &kept_box in &keep {
+            if calculate_iou(&current_box, &kept_box) > iou_threshold {
+                continue 'candidate;
+            }
+        }
+        keep.push(current_box);
     }
+
     keep
 }
 
+#[inline]
 fn calculate_iou(box1: &Bbox, box2: &Bbox) -> f32 {
     let x1 = box1.x1.max(box2.x1);
     let y1 = box1.y1.max(box2.y1);
@@ -152,7 +165,6 @@ fn calculate_iou(box1: &Bbox, box2: &Bbox) -> f32 {
     intersection / union
 }
 
-
 fn draw_bboxes_on_image(image: &mut RgbImage, bboxes: &[Bbox]) {
     for bbox in bboxes {
         let x = bbox.x1 as i32;
@@ -164,8 +176,6 @@ fn draw_bboxes_on_image(image: &mut RgbImage, bboxes: &[Bbox]) {
         draw_hollow_rect_mut(image, rect, Rgb([255, 0, 0]));
     }
 }
-
-/// 4) Display the frame
 
 fn init_sdl2(width: u32, height: u32) -> Result<Canvas<Window>> {
     let sdl_context = sdl2::init().map_err(|e| anyhow!("Failed to initialize SDL4: {}", e))?;
@@ -217,49 +227,74 @@ fn display_frame(
     Ok(())
 }
 
-// ================ THREAD STARTERS ================== //
-
-/// Inference thread: read frames from camera, run inference, annotate, send to display
-
-fn inference_thread<F, O, M>(
-    rx_infer: Receiver<RgbImage>,
-    tx_out: Sender<RgbImage>,
-    model: RunnableModel<F, O, M>,
-) where
-    F: Fact + Clone + 'static,
-    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
-    M: Borrow<Graph<F, O>> + Clone + 'static,
-{
-    while let Ok(rgb) = rx_infer.recv() {
-        match run_model(&model, &DynamicImage::ImageRgb8(rgb)) {
-            Ok(annotated) => {
-                // send annotated image back
-                if tx_out.send(annotated).is_err() {
-                    break;
-                }
-            }
-            Err(e) => eprintln!("Inference error: {e}"),
-        }
-    }
-    eprintln!("inference_thread shutting down.");
+thread_local! {
+    static MODEL_SCRATCH: RefCell<Array4<f32>> = RefCell::new(Array4::zeros((1, 3, 480, 640)));
 }
 
-const PIXEL_FORMAT_MJPEG: PixelFormat = PixelFormat::new(u32::from_le_bytes([b'M', b'J', b'P', b'G']), 0);
+fn inference_thread_tract(
+    rx_infer: Receiver<TaggedFrame>,
+    tx_out: Sender<TaggedFrame>,
+    model_path: &str,
+    width: usize,
+    height: usize,
+) {
+    let model = tract_onnx::onnx()
+        .model_for_path(model_path).unwrap()
+        .with_input_fact(0, f32::fact([1, 3, height, width]).into()).unwrap()
+        .into_optimized().unwrap()
+        .into_runnable().unwrap();
+
+    while let Ok(tagged) = rx_infer.recv() {
+        let seq_id = tagged.seq_id;
+        let rgb = tagged.image;
+        let result = run_model_tract(&model, DynamicImage::ImageRgb8(rgb));
+        if let Ok(annotated) = result {
+            let output = TaggedFrame { seq_id, image: annotated };
+            tx_out.send(output).unwrap();
+        }
+    }
+}
+
+fn inference_thread_onnx(
+    rx_infer: Receiver<TaggedFrame>,
+    tx_out: Sender<TaggedFrame>,
+    model_path: &str,
+    width: usize,
+    height: usize,
+) {
+    let model = Session::builder().unwrap()
+        .with_optimization_level(GraphOptimizationLevel::Level3).unwrap()
+        .with_intra_threads(num_cpus::get()).unwrap()
+        .commit_from_file(model_path).unwrap();
+
+    while let Ok(tagged) = rx_infer.recv() {
+        let seq_id = tagged.seq_id;
+        let rgb = tagged.image;
+        //let result = run_model_onnx(&model, DynamicImage::ImageRgb8(rgb));
+        //if let Ok(annotated) = result {
+        //    let output = TaggedFrame { seq_id, image: annotated };
+        //    tx_out.send(output).unwrap();
+        //}
+    }
+}
+
+
 
 fn main() -> Result<()> {
-    // 1) Parse CLI arguments
+    // 0) Parse CLI arguments
     let args = CliArgs::parse();
     let width = 640;
-    let height = 640;
+    let height = 480;
 
-    // 2) Load and optimize the ONNX model
-    let model = tract_onnx::onnx()
-        .model_for_path(&args.weights)?
-        .with_input_fact(0, f32::fact([1, 3, width as i32, height as i32]).into())?
-        .into_optimized()?
-        .into_runnable()?;
+    // 1) Install a custom Ctrl+C handler
+    ctrlc::set_handler(move || {
+        eprintln!("Received Ctrl+C! Exiting now...");
+        process::exit(0);
+    }).expect("Error setting Ctrl-C handler"); 
 
-    // 3) Initialize libcamera + find camera 
+
+
+    // 2) Initialize libcamera + find camera 
     let mgr = CameraManager::new()?;
     let cams = mgr.cameras();
     let cam = match cams.get(0) {
@@ -286,7 +321,7 @@ fn main() -> Result<()> {
     // 4. Configure the camera for MJPEG (since RG24 is not supported)
     let mut cfgs = cam.generate_configuration(&[StreamRole::VideoRecording]).unwrap();
     cfgs.get_mut(0).unwrap().set_pixel_format(PIXEL_FORMAT_MJPEG);
-    //cfgs.get_mut(0).unwrap().set_size(Size { width, height });
+    cfgs.get_mut(0).unwrap().set_size(Size { width, height });
 
     println!("Generated config: {:#?}", cfgs);
 
@@ -339,23 +374,42 @@ fn main() -> Result<()> {
         .map_err(|e| Error::msg(format!("Failed to init SDL2: {e}")))?;
     
     // 7) Create inference channels
-    let (tx_infer, rx_infer) = bounded::<RgbImage>(4);
-    let (tx_annotated, rx_annotated) = bounded::<RgbImage>(4);
+    let (tx_infer, rx_infer) = bounded::<TaggedFrame>(4);
+    let (tx_annotated, rx_annotated) = bounded::<TaggedFrame>(4);
 
-    // 8) Spawn inference threads
-    let concurrency = num_cpus::get()-1;
-    for _ in 0..concurrency {
-        let rx_infer_clone = rx_infer.clone();
-        let tx_annotated_clone = tx_annotated.clone();
-        let model = model.clone();
-        thread::spawn(move || {
-            inference_thread(rx_infer_clone, tx_annotated_clone, model);
-        });
-    }
+    // 2) Start inference threads 
+    // Note, tract is not inheretly multithreaded, hence the different handling
+    match args.engine.as_str() {
+        "tract" => {
+            let concurrency = num_cpus::get();
+            for _ in 0..concurrency {
+                let rx_infer_clone = rx_infer.clone();
+                let tx_annotated_clone = tx_annotated.clone();
+                let model_path = args.weights.clone();
+                thread::spawn(move || {
+                    inference_thread_tract(rx_infer_clone, tx_annotated_clone, &model_path, width.try_into().unwrap(), height.try_into().unwrap());
+                });
+            }
+        },
+        "onnx" => {
+            let rx_infer_clone = rx_infer.clone();
+            let tx_annotated_clone = tx_annotated.clone();
+            thread::spawn(move || {
+                inference_thread_tract(rx_infer_clone, tx_annotated_clone, &args.weights, width.try_into().unwrap(), height.try_into().unwrap());
+            });
+        },
+        _ => {
+            eprintln!("Unsupported engine: {}", args.engine);
+            return Ok(());
+        }
+    };
+
     drop(tx_annotated); // to let them shut down eventually
 
     // 9) Main loop: handle camera requests + display
     let mut frame_count = 0;
+    let mut annotated_count = 1;
+    let mut pending_map = std::collections::HashMap::new();
     while frame_count < args.num_frames {
         // Wait for next completed request
         let mut req = match rx_req.recv_timeout(Duration::from_secs(2)) {
@@ -375,17 +429,24 @@ fn main() -> Result<()> {
             &frame_data[..bytes_used],
             ImageFormat::Jpeg,
         ) {
-            Ok(img) => img.to_rgb8(),
+            Ok(img) => {
+                frame_count += 1;
+                img.to_rgb8()
+                },
             Err(e) => {
                 eprintln!("Failed to decode MJPEG: {e}");
-                // re-queue for next time
                 cam.queue_request(req)?;
                 continue;
             }
         };
 
+        let tagged = TaggedFrame {
+            seq_id: frame_count,
+            image: decoded,
+        };
+
         // Send to inference
-        match tx_infer.send(decoded) {
+        match tx_infer.send(tagged) {
             Ok(_) => (),
             Err(_) => {
                 eprintln!("Inference channel closed");
@@ -399,20 +460,33 @@ fn main() -> Result<()> {
 
         // If an annotated image is available, display it
         if let Ok(annotated) = rx_annotated.try_recv() {
-            display_frame(&mut canvas, &annotated)?;
-            println!("Frame {frame_count}");
-            frame_count += 1;
+            pending_map.insert(annotated.seq_id, annotated.image);
         }
+
+        // Display any pending frames
+        while let Some(image) = pending_map.remove(&annotated_count) {
+            display_frame(&mut canvas, &image)?;
+            println!("Displayed frame {}", annotated_count);
+            annotated_count += 1;
+        } 
     }
 
     // Cleanup
     // Let the inference threads exit
     drop(rx_infer);
     drop(tx_infer);
+
     // Drain any remaining annotated images
-    while let Ok(annotated) = rx_annotated.try_recv() {
-        display_frame(&mut canvas, &annotated)?;
+    if let Ok(annotated) = rx_annotated.try_recv() {
+        pending_map.insert(annotated.seq_id, annotated.image);
     }
+
+    // Display any pending frames
+    while let Some(image) = pending_map.remove(&annotated_count) {
+        display_frame(&mut canvas, &image)?;
+        println!("Displayed frame {}", annotated_count);
+        annotated_count += 1;
+    } 
 
     // Stop camera
     cam.stop()?;
