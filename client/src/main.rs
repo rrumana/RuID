@@ -237,12 +237,12 @@ fn inference_thread_tract(
     model_path: &str,
     width: usize,
     height: usize,
-) {
+) -> Result<()> {
     let model = tract_onnx::onnx()
-        .model_for_path(model_path).unwrap()
-        .with_input_fact(0, f32::fact([1, 3, height, width]).into()).unwrap()
-        .into_optimized().unwrap()
-        .into_runnable().unwrap();
+        .model_for_path(model_path)?
+        .with_input_fact(0, f32::fact([1, 3, height, width]).into())?
+        .into_optimized()?
+        .into_runnable()?;
 
     while let Ok(tagged) = rx_infer.recv() {
         let seq_id = tagged.seq_id;
@@ -250,22 +250,24 @@ fn inference_thread_tract(
         let result = run_model_tract(&model, DynamicImage::ImageRgb8(rgb));
         if let Ok(annotated) = result {
             let output = TaggedFrame { seq_id, image: annotated };
-            tx_out.send(output).unwrap();
+            tx_out.send(output)?;
         }
     }
+
+    Ok(())
 }
 
 fn inference_thread_onnx(
     rx_infer: Receiver<TaggedFrame>,
-    tx_out: Sender<TaggedFrame>,
+    _tx_out: Sender<TaggedFrame>,
     model_path: &str,
-    width: usize,
-    height: usize,
-) {
-    let model = Session::builder().unwrap()
-        .with_optimization_level(GraphOptimizationLevel::Level3).unwrap()
-        .with_intra_threads(num_cpus::get()).unwrap()
-        .commit_from_file(model_path).unwrap();
+    _width: usize,
+    _height: usize,
+) -> Result<()> {
+    let _model = Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_intra_threads(num_cpus::get())?
+        .commit_from_file(model_path)?;
 
     while let Ok(tagged) = rx_infer.recv() {
         let seq_id = tagged.seq_id;
@@ -276,25 +278,22 @@ fn inference_thread_onnx(
         //    tx_out.send(output).unwrap();
         //}
     }
+
+    Ok(())
 }
 
 
 
 fn main() -> Result<()> {
-    // 0) Parse CLI arguments
     let args = CliArgs::parse();
     let width = 640;
     let height = 480;
 
-    // 1) Install a custom Ctrl+C handler
     ctrlc::set_handler(move || {
         eprintln!("Received Ctrl+C! Exiting now...");
         process::exit(0);
     }).expect("Error setting Ctrl-C handler"); 
 
-
-
-    // 2) Initialize libcamera + find camera 
     let mgr = CameraManager::new()?;
     let cams = mgr.cameras();
     let cam = match cams.get(0) {
@@ -307,7 +306,10 @@ fn main() -> Result<()> {
 
     match cam.properties().get::<properties::Model>() {
         Ok(model) => println!("Using camera: {}", *model),
-        Err(e) => println!("Unable to get camera model: {}", e),
+        Err(e) => {
+            eprintln!("Failed to get camera model: {}", e);
+            return Ok(());
+        }
     }
 
     let mut cam = match cam.acquire() {
@@ -318,12 +320,26 @@ fn main() -> Result<()> {
         }
     }; 
 
-    // 4. Configure the camera for MJPEG (since RG24 is not supported)
-    let mut cfgs = cam.generate_configuration(&[StreamRole::VideoRecording]).unwrap();
-    cfgs.get_mut(0).unwrap().set_pixel_format(PIXEL_FORMAT_MJPEG);
-    cfgs.get_mut(0).unwrap().set_size(Size { width, height });
+    let mut cfgs = match cam.generate_configuration(&[StreamRole::VideoRecording]) {
+        Some(cfgs) => cfgs,
+        None => {
+            eprintln!("Failed to generate camera configuration.");
+            return Ok(());
+        }
+    };
 
-    println!("Generated config: {:#?}", cfgs);
+    match cfgs.get_mut(0) {
+        Some(mut cfg) => {
+            cfg.set_pixel_format(PIXEL_FORMAT_MJPEG);
+            cfg.set_size(Size { width, height });
+        },
+        None => {
+            eprintln!("Failed to get camera configuration");
+            return Ok(());
+        }
+    }
+
+    //println!("Generated config: {:#?}", cfgs);
 
     match cfgs.validate() {
         CameraConfigurationStatus::Valid => println!("Camera configuration valid!"),
@@ -333,7 +349,6 @@ fn main() -> Result<()> {
 
     cam.configure(&mut cfgs).expect("Unable to configure camera");
 
-    // 5. Allocate buffers
     let mut alloc = FrameBufferAllocator::new(&cam);
     let cfg = cfgs.get(0).unwrap();
     let stream = cfg.stream().unwrap();
@@ -345,25 +360,22 @@ fn main() -> Result<()> {
         .map(MemoryMappedFrameBuffer::new)
         .collect::<Result<Vec<_>, _>>()?;
 
-    // 6. Create requests
-    let reqs = buffers
+    let reqs: Vec<_> = buffers
         .into_iter()
         .enumerate()
         .map(|(i, buf)| {
-            let mut req = cam.create_request(Some(i as u64)).unwrap();
-            req.add_buffer(&stream, buf).unwrap();
+            let mut req = cam.create_request(Some(i as u64)).expect("Failed to create request");
+            req.add_buffer(&stream, buf).expect("Failed to add buffer to request");
             req
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    // 7. Setup request-completed callback channel
     let (tx_req, rx_req) = mpsc::channel();
     cam.on_request_completed(move |req| {
-        tx_req.send(req).unwrap();
+        tx_req.send(req).expect("Failed to send completed request");
     });
 
-    // 8. Start capturing
-    cam.start(None).unwrap();
+    cam.start(None)?;
     for req in reqs {
         println!("Request queued for execution: {req:#?}");
         cam.queue_request(req).unwrap();
@@ -387,7 +399,7 @@ fn main() -> Result<()> {
                 let tx_annotated_clone = tx_annotated.clone();
                 let model_path = args.weights.clone();
                 thread::spawn(move || {
-                    inference_thread_tract(rx_infer_clone, tx_annotated_clone, &model_path, width.try_into().unwrap(), height.try_into().unwrap());
+                    inference_thread_tract(rx_infer_clone, tx_annotated_clone, &model_path, width.try_into().unwrap(), height.try_into().unwrap()).unwrap();
                 });
             }
         },
@@ -395,7 +407,7 @@ fn main() -> Result<()> {
             let rx_infer_clone = rx_infer.clone();
             let tx_annotated_clone = tx_annotated.clone();
             thread::spawn(move || {
-                inference_thread_tract(rx_infer_clone, tx_annotated_clone, &args.weights, width.try_into().unwrap(), height.try_into().unwrap());
+                inference_thread_onnx(rx_infer_clone, tx_annotated_clone, &args.weights, width.try_into().unwrap(), height.try_into().unwrap());
             });
         },
         _ => {
