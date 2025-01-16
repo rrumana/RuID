@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use ndarray::{Array4, s};
 use num_cpus;
 use opencv::{
     core::{self, Mat, Rect, Scalar, Vec3b},
@@ -14,9 +15,13 @@ use opencv::{
         CAP_PROP_FRAME_WIDTH,
         CAP_PROP_FRAME_HEIGHT,
         CAP_PROP_FPS,
-        CAP_PROP_FOURCC,
     },
 };
+use ort::inputs;
+use ort::session::{
+    Session, 
+    SessionOutputs,
+    builder::GraphOptimizationLevel};
 use std::{
     borrow::Borrow,
     cell::RefCell,
@@ -28,7 +33,6 @@ use std::{
     time::Instant,
     collections::HashMap,
 };
-use tract_ndarray::{Array4, s};
 use tract_onnx::prelude::*;
 
 ///////////////////////////////////////
@@ -56,7 +60,7 @@ struct TaggedFrame {
 
 #[derive(Parser)]
 struct CliArgs {
-    /// Path to ONNX or .tract model weights
+    /// Path to ONNX or model weights
     #[arg(long)]
     weights: String,
 
@@ -125,6 +129,54 @@ where
     Ok(non_maximum_suppression(bboxes, 0.5))
 }
 
+fn run_model_onnx(
+    model: &Session,
+    mat: &Mat
+) -> Result<Vec<Bbox>> {
+    let rows = mat.rows() as usize;
+    let cols = mat.cols() as usize;
+
+    MODEL_SCRATCH.with(|scratch_cell| {
+        let mut scratch = scratch_cell.borrow_mut();
+        for y in 0..rows {
+            for x in 0..cols {
+                let px = *mat.at_2d::<Vec3b>(y as i32, x as i32).unwrap();
+                scratch[[0, 0, y, x]] = px[2] as f32 / 255.0;
+                scratch[[0, 1, y, x]] = px[1] as f32 / 255.0;
+                scratch[[0, 2, y, x]] = px[0] as f32 / 255.0;
+            }
+        }
+    });
+
+    let image_tensor: Array4<f32> = MODEL_SCRATCH.with(|scratch_cell| {
+        let scratch = scratch_cell.borrow();
+        scratch.to_owned()
+    });
+
+    let outputs: SessionOutputs = model.run(inputs![image_tensor]?)?;
+	  let results = outputs["output0"].try_extract_tensor::<f32>()?.t().into_owned(); 
+     
+    let mut bboxes = Vec::new();
+    for i in 0..results.len_of(tract_ndarray::Axis(0)) {
+        let row = results.slice(s![i, .., ..]);
+        let confidence = row[[4, 0]];
+        if confidence >= 0.5 {
+            let x_c = row[[0, 0]];
+            let y_c = row[[1, 0]];
+            let w_  = row[[2, 0]];
+            let h_  = row[[3, 0]];
+            let x1 = x_c - w_ / 2.0;
+            let y1 = y_c - h_ / 2.0;
+            let x2 = x_c + w_ / 2.0;
+            let y2 = y_c + h_ / 2.0;
+            bboxes.push(Bbox::new(x1, y1, x2, y2, confidence));
+        }
+    }
+
+    Ok(non_maximum_suppression(bboxes, 0.5))
+}
+
+
 fn draw_bboxes(mat: &mut Mat, bboxes: &[Bbox]) -> opencv::Result<()> {
     for bbox in bboxes {
         let x1 = bbox.x1.max(0.0) as i32;
@@ -156,7 +208,7 @@ fn draw_bboxes(mat: &mut Mat, bboxes: &[Bbox]) -> opencv::Result<()> {
             pt1,
             imgproc::FONT_HERSHEY_SIMPLEX,
             0.5,
-            Scalar::new(255.0, 255.0, 255.0, 1.0), // white
+            Scalar::new(255.0, 255.0, 255.0, 1.0),
             1,
             imgproc::LINE_8,
             false,
@@ -219,14 +271,41 @@ fn inference_thread_tract(
 
         match run_model_tract(&model, &mat) {
             Ok(bboxes) => {
-                // Draw bounding boxes
                 if let Err(e) = draw_bboxes(&mut mat, &bboxes) {
                     eprintln!("Error drawing bboxes: {:?}", e);
                 }
                 let output = TaggedFrame { seq_id, mat };
                 tx_out.send(output)?;
             },
-            Err(e) => eprintln!("Error in Tract inference: {:?}", e),
+            Err(e) => eprintln!("Error during Tract inference: {:?}", e),
+        }
+    }
+    Ok(())
+}
+
+fn inference_thread_onnx(
+    rx_infer: Receiver<TaggedFrame>,
+    tx_out: Sender<TaggedFrame>,
+    model_path: &str,
+) -> Result<()> { 
+    let model = Session::builder()?
+    .with_optimization_level(GraphOptimizationLevel::Level3)?
+    .with_intra_threads(num_cpus::get())?
+    .commit_from_file(model_path)?; 
+
+    while let Ok(tagged) = rx_infer.recv() {
+        let seq_id = tagged.seq_id;
+        let mut mat = tagged.mat.clone();
+
+        match run_model_onnx(&model, &mat) {
+            Ok(bboxes) => {
+                if let Err(e) = draw_bboxes(&mut mat, &bboxes) {
+                    eprintln!("Error drawing bboxes: {:?}", e);
+                }
+                let output = TaggedFrame { seq_id, mat };
+                tx_out.send(output)?;
+            },
+            Err(e) => eprintln!("Error during ONNX inference: {:?}", e),
         }
     }
     Ok(())
@@ -281,6 +360,20 @@ fn main() -> Result<()> {
                     }
                 });
             }
+        },
+        "onnx" => {
+            let rx_infer_clone = rx_infer.clone();
+            let tx_annotated_clone = tx_annotated.clone();
+            let model_path = args.weights.clone();
+            thread::spawn(move || {
+                if let Err(e) = inference_thread_onnx(
+                    rx_infer_clone,
+                    tx_annotated_clone,
+                    &model_path,
+                ) {
+                    eprintln!("ONNX inference thread error: {:?}", e);
+                }
+            });
         },
         _ => {
             eprintln!("Unsupported engine: {}", args.engine);
