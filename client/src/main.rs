@@ -7,7 +7,15 @@ use opencv::{
     highgui,
     imgproc,
     prelude::*,
-    videoio::{VideoCapture, CAP_V4L2},
+    videoio::{
+        VideoCapture,
+        CAP_V4L2,
+        CAP_PROP_BUFFERSIZE,
+        CAP_PROP_FRAME_WIDTH,
+        CAP_PROP_FRAME_HEIGHT,
+        CAP_PROP_FPS,
+        CAP_PROP_FOURCC,
+    },
 };
 use std::{
     borrow::Borrow,
@@ -237,6 +245,10 @@ fn main() -> Result<()> {
 
     // Initialize an OpenCV VideoCapture that references libcamera (or another suitable backend)
     let mut cap = VideoCapture::new(0, CAP_V4L2)?; 
+    cap.set(CAP_PROP_BUFFERSIZE, 1.0)?;
+    cap.set(CAP_PROP_FRAME_WIDTH, width as f64)?;
+    cap.set(CAP_PROP_FRAME_HEIGHT, height as f64)?;
+    cap.set(CAP_PROP_FPS, 30.0)?;
 
     if !cap.is_opened()? {
         return Err(anyhow!("Could not open camera with OpenCV. Check your pipeline/device."));
