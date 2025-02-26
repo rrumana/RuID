@@ -15,6 +15,9 @@ My goals for this project are the following:
   - Add features as needed.
 
 # Completion
+
+This project is on hold until further notice. My laptop died and I no longer have a development device with a camera. Development on my Raspberry Pi is possible but the compilations times are killer since release compilation is neccessary to assess performance.
+
 I have made a program that takes camera input using libcamera and feeds those frames into Yolov11-nano. Since the Tract runtime is not threaded, I have added a basic threading implementation using some threads and channels. Lots more can be done to optimize this.
 
 I am getting about 20FPS on my laptop at about 100% CPU utilization before quantization or any other optiizations. This seems promising, but I am planning on adding support for onnx runtime to comapre. I will add a command line flag to select your runtime, that way I can compare Trace + threading to Onnxruntime. If it turns out that I cannot beat Onnxruntime, I will end up using that.
