@@ -10,10 +10,10 @@ anyhow       = "1.0"
 thiserror    = "1.0"
 gst            = { version = "0.22", package = "gstreamer",           features = ["v1_22"] }
 gst-app        = { version = "0.22", package = "gstreamer-app",       features = ["v1_22"] }
-gst-video      = { version = "0.22", package = "gstreamer-video",     features = ["v1_22"] }
-gst-allocators = { version = "0.22", package = "gstreamer-allocators", features = ["v1_22"] }
-gst-sys        = { version = "0.22", package = "gstreamer-sys",       features = ["v1_22"] }
-
+gst-allocators = { version = "0.22", package = "gstreamer-allocators",features = ["v1_22"] }
+futures-core = "0.3"
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 serial_test = "2"

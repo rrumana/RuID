@@ -25,6 +25,9 @@ use gst::prelude::*;
 use std::os::unix::prelude::RawFd;
 use std::time::Duration;
 
+mod stream;
+pub use stream::frame_stream;
+
 /// Metadata + FD for a single captured frame.
 #[derive(Debug)]
 pub struct DmaBufFrame {
@@ -56,15 +59,22 @@ impl Camera {
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
         gst::init().map_err(|e| anyhow!("GStreamer init failed: {e}"))?;
 
-        let pipe_str = format!(
-            "libcamerasrc ! video/x-raw,format=NV12,width={w},height={h},framerate={f}/1 \
-             ! queue leaky=2 max-size-buffers=8 ! appsink name=sink emit-signals=true \
-             sync=false max-buffers=8 drop=true",
-            w = width,
-            h = height,
-            f = fps
-        );
+        let src = if gst::ElementFactory::find("libcamerasrc").is_some() {
+            // Pi / libcamera stack
+            "libcamerasrc"
+        } else {
+            // Laptop or USB webcam
+            "v4l2src device=/dev/video0 io-mode=2"
+        };
 
+        let pipe_str = format!(
+            "{src} ! videoconvert ! video/x-raw,format=NV12,width={w},height={h},framerate={f}/1 \
+            ! queue leaky=2 max-size-buffers=8 ! tee name=t \
+            t. ! queue leaky=2 max-size-buffers=1 ! videoconvert ! autovideosink sync=false \
+            t. ! queue leaky=2 max-size-buffers=8 ! appsink name=sink emit-signals=true \
+            sync=false",
+            src = src, w = width, h = height, f = fps
+        );
         let pipeline = gst::parse::launch(&pipe_str)?
             .downcast::<gst::Pipeline>()
             .map_err(|_| anyhow!("Not a gst::Pipeline"))?;
