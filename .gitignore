@@ -1,3 +1,16 @@
+# Rust / Cargo
 /target
+**/*.rs.bk
+Cargo.lock
 
-client/models
+# Python venv, caches
+.venv/
+/__pycache__/
+
+# Model artefacts & large binaries
+/models/
+/scripts/*.onnx
+
+# IDEs
+.idea/
+.vscode/
