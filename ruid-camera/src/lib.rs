@@ -28,11 +28,20 @@ use std::time::Duration;
 mod stream;
 pub use stream::frame_stream;
 
+/// A captured frame.
+///
+/// * `DmaBuf(fd)`  – zero‑copy path (fast on Pi, some webcams)
+/// * `Cpu(bytes)`  – fallback heap copy (always works)
+#[derive(Debug)]
+pub enum FrameBacking {
+    DmaBuf(RawFd),
+    Cpu(Vec<u8>),      // NV12 bytes, stride == width*2
+}
+
 /// Metadata + FD for a single captured frame.
 #[derive(Debug)]
-pub struct DmaBufFrame {
-    /// DMA‑Buf file descriptor (owning).
-    pub fd: RawFd,
+pub struct VideoFrame {
+    pub backing: FrameBacking,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -63,8 +72,8 @@ impl Camera {
             // Pi / libcamera stack
             "libcamerasrc"
         } else {
-            // Laptop or USB webcam
-            "v4l2src device=/dev/video0 io-mode=2"
+            // PC webcam
+            "v4l2src device=/dev/video0 io-mode=4"
         };
 
         let pipe_str = format!(
@@ -88,51 +97,47 @@ impl Camera {
         Ok(Self { pipeline, appsink })
     }
 
-    /// Blocking retrieval – Hate this with a passion gst is hard.
-    pub fn next_frame_blocking(&self) -> Result<DmaBufFrame> {
+    /// Blocking retrieval – Hate this with a passion but gst is hard.
+    pub fn next_frame_blocking(&self) -> Result<VideoFrame> {
         let sample = self
             .appsink
             .pull_sample()
             .map_err(|_| anyhow!("Failed to pull sample"))?;
-        Self::sample_to_dmabuf(sample)
+        Self::sample_to_frame(sample)
     }
 
-    /// Convert a `gst::Sample` into our [`DmaBufFrame`] wrapper.
-    fn sample_to_dmabuf(sample: gst::Sample) -> Result<DmaBufFrame> {
-        // Extract buffer + caps.
+    /// Convert a `gst::Sample` into our [`VideoFrame`] wrapper.
+    fn sample_to_frame(sample: gst::Sample) -> Result<VideoFrame> {
         let buffer = sample.buffer().ok_or_else(|| anyhow!("Sample has no buffer"))?;
-        let caps = sample.caps().ok_or_else(|| anyhow!("Sample has no caps"))?;
-        let s = caps.structure(0).ok_or_else(|| anyhow!("Caps missing struct"))?;
-        let width = s.get::<i32>("width")? as u32;
+        let caps   = sample.caps().ok_or_else(|| anyhow!("Sample has no caps"))?;
+        let s      = caps.structure(0).ok_or_else(|| anyhow!("Caps missing struct"))?;
+        let width  = s.get::<i32>("width")?  as u32;
         let height = s.get::<i32>("height")? as u32;
-        let stride = s
-            .get::<i32>("stride")
-            .unwrap_or((width * 2) as i32) as u32;           // NV12 ≈ 2 bytes/px
+        let stride = (width * 2) as u32;                // NV12 bytes/px
 
-        if buffer.n_memory() == 0 {
-            return Err(anyhow!("Buffer has no memory"));
+        let pts = buffer.pts().and_then(|t| Some(Duration::from_nanos(t.nseconds())))
+                            .unwrap_or(Duration::ZERO);
+
+        // ----- Try fast DMA‑Buf path -------------------------------------------------
+        if buffer.n_memory() > 0 {
+            let mem = buffer.peek_memory(0);
+            if let Some(dmabuf) = mem.downcast_memory_ref::<gst_allocators::DmaBufMemory>() {
+                return Ok(VideoFrame {
+                    backing: FrameBacking::DmaBuf(dmabuf.fd()),
+                    width, height, stride, pts,
+                });
+            }
         }
 
-        // Down‑cast the first memory block to DmaBufMemoryRef
-        let mem = buffer.peek_memory(0);
-        let dmabuf =
-            mem.downcast_memory_ref::<gst_allocators::DmaBufMemory>()
-                .ok_or_else(|| anyhow!("Memory is not DMA‑Buf; zero‑copy path broken"))?;
+        // ----- Fallback: map + copy into Vec<u8> ------------------------------------
+        let map = buffer.map_readable()?;          // &[u8] for entire NV12 image
+        let mut bytes = Vec::with_capacity(map.size());
+        bytes.extend_from_slice(map.as_slice());   // one memcpy
+        drop(map);                                 // unmap
 
-        let fd: RawFd = dmabuf.fd();
-
-        // PTS → Duration (or zero if missing)
-        let pts = buffer
-            .pts()
-            .map(|t| Duration::from_nanos(t.nseconds()))
-            .unwrap_or(Duration::ZERO);
-
-        Ok(DmaBufFrame {
-            fd,
-            width,
-            height,
-            stride,
-            pts,
+        Ok(VideoFrame {
+            backing: FrameBacking::Cpu(bytes),
+            width, height, stride, pts,
         })
     }
 }
@@ -155,7 +160,7 @@ mod tests {
     fn capture_one() {
         let cam = Camera::new(640, 480, 30).expect("create");
         let frame = cam.next_frame_blocking().expect("frame");
-        println!("Received fd {} ({}×{}) stride {} bytes", frame.fd, frame.width, frame.height, frame.stride);
+        println!("Received fd {:?} ({}×{}) stride {} bytes", frame.backing, frame.width, frame.height, frame.stride);
         assert_eq!(frame.width, 640);
     }
 }

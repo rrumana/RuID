@@ -1,9 +1,5 @@
 [workspace]
-members = [
-    "ru_common",
-    "camera_node",
-    "aggregator"
-, "ruid-camera"]
+members = ["ruid-camera"]
 
 resolver = "2"
 
