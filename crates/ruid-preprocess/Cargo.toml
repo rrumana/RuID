@@ -1,0 +1,24 @@
+[package]
+name        = "ruid-preprocess"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Ryan Rumana <ryan.rumana@gmail.com>"]
+resolver    = "2"
+
+[features]
+# default = []
+gpu  = ["opencl3"] # opt‑in: `--features gpu`
+
+[dependencies]
+anyhow   = "1.0"
+ndarray  = "0.15"
+image    = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+resize   = "0.8"          # Lanczos/Spline scalers (pure CPU)
+rgb          = "0.8"                       # needed by the resize crate
+
+# optional OpenCL backend skeleton
+opencl3 = { version = "0.9", optional = true, default-features = false }
+
+
+#link to ruid‑camera via relative path
+ruid-camera = { path = "../ruid-camera" }

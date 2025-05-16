@@ -19,3 +19,5 @@ libc = "0.2.172"
 [dev-dependencies]
 serial_test = "2"
 
+#link to ruid‑preprocess via relative path
+ruid-preprocess = { path = "../ruid-preprocess" }

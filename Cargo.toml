@@ -1,23 +1,10 @@
 [workspace]
-members = ["ruid-camera"]
-
+members = [
+    "crates/ruid-camera", "crates/ruid-detect",
+    "crates/ruid-preprocess",
+    "crates/ruid-detect"
+    ]
 resolver = "2"
-
-[workspace.dependencies]
-# shared versions pinned here
-serde       = { version = "1.0.219", features = ["derive"] }
-ndarray     = "0.16.1"
-opencv      = "0.94.4"
-tract-onnx  = "0.21.13"
-axum        = { version = "0.8.4", features = ["json"] }
-rayon       = "1.10.0"
-tokio       = { version = "1.45", features = ["full"] }
-thiserror   = "2.0.12"
-hostname    = "0.4.1"
-postcard    = { version = "1.1.1", features = ["alloc"] }
-linfa       = { version = "0.7.1"}
-reqwest     = { version = "0.12.15", features = ["json", "stream"] }
-kalman      = { version = "0.3"}
 
 [profile.release]
 lto = "thin"
