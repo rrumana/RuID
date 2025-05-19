@@ -1,12 +1,17 @@
+## -1 | Reality
+
+This project is just in it's infancy, I do it in my spare time for fun. Understand that this is the where I hope it will end up, not where the project is today. I'll update this occasionally with progress, but don't expect this document to represent the actual program for quire some time.
+
+---
+
 ## 0  |  Big‑picture goals
 
 | Constraint             | Target                                                                                  | Why it matters                                                  |
 | ---------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
 | **Edge HW**            | Raspberry Pi 4/5 (4× A72 + V3D/VC6) **or** generic x86‑64 dev PC                        | Covers both low‑power deployment and developer laptops          |
-| **Throughput**         | ≥ 8 FPS @ 640×480 with **≤ 2 W CPU**                                                    | Smooth enough for tracking; leaves headroom for other workloads |
+| **Throughput**         | ≥ 10 FPS @ 640×480 with **≤ Pi 5 8GB**                                                    | Smooth enough for tracking; leaves headroom for other workloads |
 | **Copies on hot‑path** | **Zero** from camera sensor → GPU inference                                             | Copies kill cache and battery                                   |
-| **Latency budg.**      | ≤ 120 ms edge→cluster identify round‑trip                                               | Matches interactive use cases (door unlock, AR overlay)         |
-| **Observability**      | Prom metrics + OpenTelemetry traces everywhere                                          | Perf regressions must be obvious                                |
+| **Latency budg.**      | ≤ 120 ms edge→cluster identify round‑trip                                               | Matches interactive use cases (door unlock, AR overlay)         |                              |
 | **Modularity**         | Each stage = standalone crate; swap & upgrade independently                             | Re‑train models, change trackers without kernel recompile       |
 | **Repro builds**       | `cargo build --release -Zbuild-std` cross‑compiled; GH Actions matrix + `docker buildx` | Deterministic binaries for ARM & x86                            |
 | **Local preview**      | Optional tee to GUI; headless by default                                                | Debug in one binary, ship the same binary                       |
@@ -227,5 +232,3 @@ Flags:
 * `--trace=info` : set global tracing filter
 
 ---
-
-### Keep this file (`ARCHITECTURE.md`) at repo root ‑ it is the single point of truth for RuID v2’s design.
