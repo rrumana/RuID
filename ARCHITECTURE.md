@@ -9,7 +9,7 @@ This project is just in it's infancy, I do it in my spare time for fun. Understa
 | Constraint             | Target                                                                                  | Why it matters                                                  |
 | ---------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
 | **Edge HW**            | Raspberry Pi 4/5 (4× A72 + V3D/VC6) **or** generic x86‑64 dev PC                        | Covers both low‑power deployment and developer laptops          |
-| **Throughput**         | ≥ 10 FPS @ 640×480 with **≤ Pi 5 8GB**                                                    | Smooth enough for tracking; leaves headroom for other workloads |
+| **Throughput**         | ≥ 10 FPS @ 640×480 with **Pi 5 8GB**                                                    | Smooth enough for tracking; leaves headroom for other workloads |
 | **Copies on hot‑path** | **Zero** from camera sensor → GPU inference                                             | Copies kill cache and battery                                   |
 | **Latency budg.**      | ≤ 120 ms edge→cluster identify round‑trip                                               | Matches interactive use cases (door unlock, AR overlay)         |                              |
 | **Modularity**         | Each stage = standalone crate; swap & upgrade independently                             | Re‑train models, change trackers without kernel recompile       |
