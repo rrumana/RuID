@@ -20,13 +20,44 @@
 //! timestamp).  Downstream GPU preprocess code can import the fd
 //! directly via EGL/Vulkan without an intermediate memcpy.
 
-use anyhow::{anyhow, Result};
+use thiserror::Error;
 use gst::prelude::*;
 use std::os::unix::prelude::RawFd;
 use std::time::Duration;
 
 mod stream;
 pub use stream::frame_stream;
+
+// Custom error types for this crate, useful as this project grows
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("GStreamer init failed: {0}")]
+    GstInit(#[source] gst::glib::BoolError),
+    #[error("Failed to parse pipeline: {0}")]
+    ParsePipeline(#[source] gst::glib::Error),
+    #[error("Pipeline is not a gst::Pipeline")]
+    NotPipeline,
+    #[error("AppSink element not found")]
+    AppSinkNotFound,
+    #[error("AppSink element downcast failed")]
+    AppSinkDowncastFailed,
+    #[error("Failed to set pipeline to Playing: {0}")]
+    StateChange(#[source] gst::StateChangeError),
+    #[error("Failed to pull sample: {0}")]
+    PullSample(#[source] gst::glib::Error),
+    #[error("Sample has no buffer")]
+    MissingBuffer,
+    #[error("Sample has no caps")]
+    MissingCaps,
+    #[error("Caps missing struct")]
+    MissingStructure,
+    #[error("Failed to get field value: {0}")]
+    FieldError(#[source] gst::glib::value::GetError),
+    #[error("Buffer map failed: {0}")]
+    BufferMap(#[source] gst::error::MapError),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// A captured frame.
 ///
@@ -66,7 +97,7 @@ impl Camera {
     /// }
     /// ```
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
-        gst::init().map_err(|e| anyhow!("GStreamer init failed: {e}"))?;
+        gst::init().map_err(Error::GstInit)?;
 
         let src = if gst::ElementFactory::find("libcamerasrc").is_some() {
             // Pi / libcamera stack
@@ -84,17 +115,35 @@ impl Camera {
             sync=false",
             src = src, w = width, h = height, f = fps
         );
-        let pipeline = gst::parse::launch(&pipe_str)?
+
+        let pipeline = gst::parse::launch(&pipe_str)
+            .map_err(Error::ParsePipeline)?
             .downcast::<gst::Pipeline>()
-            .map_err(|_| anyhow!("Not a gst::Pipeline"))?;
+            .map_err(|_| Error::NotPipeline)?;
 
         let appsink = pipeline
             .by_name("sink")
-            .ok_or_else(|| anyhow!("appsink not found"))?
-            .downcast::<gst_app::AppSink>().unwrap();
+            .ok_or(Error::AppSinkNotFound)?
+            .downcast::<gst_app::AppSink>()
+            .map_err(|_| Error::AppSinkDowncastFailed)?;
 
-        pipeline.set_state(gst::State::Playing)?;
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(Error::StateChange)?;
+
         Ok(Self { pipeline, appsink })
+    }
+
+    /// Asynchronous retrieval – using GStreamer's async API.
+    pub async fn next_frame(&self) -> Result<VideoFrame> {
+        todo!();       
+        // let sample = self
+        //     .appsink
+        //     .pull_sample_async()
+        //     .await
+        //     .map_err(Error::PullSample)?;
+        //
+        // Self::sample_to_frame(sample)
     }
 
     /// Blocking retrieval – Hate this with a passion but gst is hard.
@@ -102,23 +151,26 @@ impl Camera {
         let sample = self
             .appsink
             .pull_sample()
-            .map_err(|_| anyhow!("Failed to pull sample"))?;
+            .map_err(Error::PullSample)?;
+
         Self::sample_to_frame(sample)
     }
 
     /// Convert a `gst::Sample` into our [`VideoFrame`] wrapper.
     fn sample_to_frame(sample: gst::Sample) -> Result<VideoFrame> {
-        let buffer = sample.buffer().ok_or_else(|| anyhow!("Sample has no buffer"))?;
-        let caps   = sample.caps().ok_or_else(|| anyhow!("Sample has no caps"))?;
-        let s      = caps.structure(0).ok_or_else(|| anyhow!("Caps missing struct"))?;
-        let width  = s.get::<i32>("width")?  as u32;
-        let height = s.get::<i32>("height")? as u32;
+        let buffer = sample.buffer().ok_or(Error::MissingBuffer)?;
+        let caps   = sample.caps().ok_or(Error::MissingCaps)?;
+        let s      = caps.structure(0).ok_or(Error::MissingStructure)?;
+        let width  = s.get::<i32>("width").map_err(Error::FieldError)? as u32;
+        let height = s.get::<i32>("height").map_err(Error::FieldError)? as u32;
         let stride = (width * 2) as u32;                // NV12 bytes/px
 
-        let pts = buffer.pts().and_then(|t| Some(Duration::from_nanos(t.nseconds())))
-                            .unwrap_or(Duration::ZERO);
+        let pts = buffer
+            .pts()
+            .and_then(|t| Some(Duration::from_nanos(t.nseconds())))
+            .unwrap_or_else(Duration::ZERO);
 
-        // ----- Try fast DMA‑Buf path -------------------------------------------------
+        // Try fast DMA‑Buf path
         if buffer.n_memory() > 0 {
             let mem = buffer.peek_memory(0);
             if let Some(dmabuf) = mem.downcast_memory_ref::<gst_allocators::DmaBufMemory>() {
@@ -129,8 +181,8 @@ impl Camera {
             }
         }
 
-        // ----- Fallback: map + copy into Vec<u8> ------------------------------------
-        let map = buffer.map_readable()?;          // &[u8] for entire NV12 image
+        // Fallback: map + copy into Vec<u8>
+        let map = buffer.map_readable().map_err(Error::BufferMap)?;          // &[u8] for entire NV12 image
         let mut bytes = Vec::with_capacity(map.size());
         bytes.extend_from_slice(map.as_slice());   // one memcpy
         drop(map);                                 // unmap
@@ -160,10 +212,7 @@ mod tests {
     fn capture_one() {
         let cam = Camera::new(640, 480, 30).expect("create");
         let frame = cam.next_frame_blocking().expect("frame");
-        println!("Received fd {:?} ({}×{}) stride {} bytes", frame.backing, frame.width, frame.height, frame.stride);
+        println!("Received fd {:?} ({}x{}) stride {} bytes", frame.backing, frame.width, frame.height, frame.stride);
         assert_eq!(frame.width, 640);
     }
 }
-
-// ---------------------------------------------------------------------------
-// End of file

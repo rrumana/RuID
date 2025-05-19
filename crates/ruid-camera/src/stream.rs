@@ -1,11 +1,11 @@
 // ruid-camera/src/stream.rs
-use crate::{Camera, VideoFrame};
-use anyhow::Result;
+use crate::{Camera, VideoFrame, Result};
 use futures_core::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream};
 
-const DEPTH: usize = 4; // back‑pressure: appsink → channel → consumer
+// back‑pressure: appsink → channel → consumer
+const DEPTH: usize = 4;
 
 pub fn frame_stream(cam: Camera) -> impl Stream<Item = Result<VideoFrame>> {
     let (tx, rx) = mpsc::channel(DEPTH);
