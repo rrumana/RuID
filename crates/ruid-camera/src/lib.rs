@@ -7,8 +7,9 @@
 // Public API:
 //   * Camera::new() – build and start a capture pipeline
 //   * Camera::next_frame() – async stream of DmaBufFrame
-//
-// Compile on ARM & x86_64 (libcamera optional on desktops).
+// ------------------------------------------------------------
+// Build notes
+//   * Compile on ARM & x86_64 (libcamera optional on desktops).
 // ============================================================
 
 //! RuID – camera capture layer
@@ -30,9 +31,9 @@ pub use stream::frame_stream;
 
 // Custom error types for this crate, useful as this project grows
 #[derive(Error, Debug)]
-pub enum Error {
+pub enum CameraError {
     #[error("GStreamer init failed: {0}")]
-    GstInit(#[source] gst::glib::BoolError),
+    GstInit(#[source] gst::glib::Error),
     #[error("Failed to parse pipeline: {0}")]
     ParsePipeline(#[source] gst::glib::Error),
     #[error("Pipeline is not a gst::Pipeline")]
@@ -44,7 +45,7 @@ pub enum Error {
     #[error("Failed to set pipeline to Playing: {0}")]
     StateChange(#[source] gst::StateChangeError),
     #[error("Failed to pull sample: {0}")]
-    PullSample(#[source] gst::glib::Error),
+    PullSample(#[source] gst::glib::BoolError),
     #[error("Sample has no buffer")]
     MissingBuffer,
     #[error("Sample has no caps")]
@@ -52,12 +53,12 @@ pub enum Error {
     #[error("Caps missing struct")]
     MissingStructure,
     #[error("Failed to get field value: {0}")]
-    FieldError(#[source] gst::glib::value::GetError),
+    FieldError(String),
     #[error("Buffer map failed: {0}")]
-    BufferMap(#[source] gst::error::MapError),
+    BufferMap(String),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, CameraError>;
 
 /// A captured frame.
 ///
@@ -93,14 +94,14 @@ impl Camera {
     /// let cam = Camera::new(640, 480, 30).unwrap();
     /// for _ in 0..10 {
     ///     let frame = cam.next_frame_blocking().unwrap();
-    ///     println!("Got fd {} ({}×{})", frame.fd, frame.width, frame.height);
+    ///     println!("Got backing {:?} ({}×{})", frame.backing, frame.width, frame.height);
     /// }
     /// ```
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
-        gst::init().map_err(Error::GstInit)?;
+        gst::init().map_err(CameraError::GstInit)?;
 
         let src = if gst::ElementFactory::find("libcamerasrc").is_some() {
-            // Pi / libcamera stack
+            // Pi (libcamera) stack
             "libcamerasrc"
         } else {
             // PC webcam
@@ -117,19 +118,19 @@ impl Camera {
         );
 
         let pipeline = gst::parse::launch(&pipe_str)
-            .map_err(Error::ParsePipeline)?
+            .map_err(CameraError::ParsePipeline)?
             .downcast::<gst::Pipeline>()
-            .map_err(|_| Error::NotPipeline)?;
+            .map_err(|_| CameraError::NotPipeline)?;
 
         let appsink = pipeline
             .by_name("sink")
-            .ok_or(Error::AppSinkNotFound)?
+            .ok_or(CameraError::AppSinkNotFound)?
             .downcast::<gst_app::AppSink>()
-            .map_err(|_| Error::AppSinkDowncastFailed)?;
+            .map_err(|_| CameraError::AppSinkDowncastFailed)?;
 
         pipeline
             .set_state(gst::State::Playing)
-            .map_err(Error::StateChange)?;
+            .map_err(CameraError::StateChange)?;
 
         Ok(Self { pipeline, appsink })
     }
@@ -146,29 +147,29 @@ impl Camera {
         // Self::sample_to_frame(sample)
     }
 
-    /// Blocking retrieval – Hate this with a passion but gst is hard.
+    /// Blocking retrieval – Hate this with a passion but gst is hard and this is a prototype.
     pub fn next_frame_blocking(&self) -> Result<VideoFrame> {
         let sample = self
             .appsink
             .pull_sample()
-            .map_err(Error::PullSample)?;
+            .map_err(CameraError::PullSample)?;
 
         Self::sample_to_frame(sample)
     }
 
     /// Convert a `gst::Sample` into our [`VideoFrame`] wrapper.
     fn sample_to_frame(sample: gst::Sample) -> Result<VideoFrame> {
-        let buffer = sample.buffer().ok_or(Error::MissingBuffer)?;
-        let caps   = sample.caps().ok_or(Error::MissingCaps)?;
-        let s      = caps.structure(0).ok_or(Error::MissingStructure)?;
-        let width  = s.get::<i32>("width").map_err(Error::FieldError)? as u32;
-        let height = s.get::<i32>("height").map_err(Error::FieldError)? as u32;
+        let buffer = sample.buffer().ok_or(CameraError::MissingBuffer)?;
+        let caps   = sample.caps().ok_or(CameraError::MissingCaps)?;
+        let s      = caps.structure(0).ok_or(CameraError::MissingStructure)?;
+        let width  = s.get::<i32>("width").map_err(|e| CameraError::FieldError(e.to_string()))? as u32;
+        let height = s.get::<i32>("height").map_err(|e| CameraError::FieldError(e.to_string()))? as u32;
         let stride = (width * 2) as u32;                // NV12 bytes/px
 
         let pts = buffer
             .pts()
             .and_then(|t| Some(Duration::from_nanos(t.nseconds())))
-            .unwrap_or_else(Duration::ZERO);
+            .unwrap_or_else(|| Duration::ZERO);
 
         // Try fast DMA‑Buf path
         if buffer.n_memory() > 0 {
@@ -182,7 +183,7 @@ impl Camera {
         }
 
         // Fallback: map + copy into Vec<u8>
-        let map = buffer.map_readable().map_err(Error::BufferMap)?;          // &[u8] for entire NV12 image
+        let map = buffer.map_readable().map_err(|e| CameraError::BufferMap(e.to_string()))?;          // &[u8] for entire NV12 image
         let mut bytes = Vec::with_capacity(map.size());
         bytes.extend_from_slice(map.as_slice());   // one memcpy
         drop(map);                                 // unmap

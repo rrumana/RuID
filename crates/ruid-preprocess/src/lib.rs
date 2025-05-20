@@ -1,10 +1,50 @@
-//! ruid‑preprocess – resize + normalize NV12 frames.
+// ruid-preprocess/src/lib.rs
+// ============================================================
+// ruid-preprocess  –  Resize + Normalize stage for RuID v2
+// Converts camera NV12 DMA-Buf frames into model-ready
+// tensors (CHW RGB, f32 0-1) with **no extra copies** when
+// an OpenCL device is available (falls back to SIMD CPU).
+// ------------------------------------------------------------
+// Public API
+//   * Preprocessor::new(out_w, out_h)         – configure target size
+//   * Preprocessor::run(&self, &VideoFrame)   – returns ndarray::Array3<f32>
+//     (GPU path behind a `cfg(feature = "gpu")` gate)
+// ------------------------------------------------------------
+// Build notes
+//   * Compiles on x86-64 & aarch64.  
+//   * OpenCL headers optional; CPU fallback always available.
+// ============================================================
 
-use anyhow::{anyhow, Result};
-use ndarray::{Array3};
+//! RuID – preprocessing layer
+//!
+//! This crate implements a tiny, zero-copy resize & normalisation stage.
+//! On systems with OpenCL (Mesa VC6, AMD, Nvidia, etc.) it **imports the
+//! camera DMA-Buf fd directly into the GPU** and runs a 2-tap Lanczos
+//! kernel; otherwise it maps the buffer and uses a hand-vectorised NEON /
+//! AVX2 routine. Or at least that's the plan.  Currently only the CPU path exists
+//!
+//! Output is an `ndarray::Array3<f32>` in **CHW** order, already scaled to
+//! 0-1.0, ready to be fed into the YOLO/ResNet detectors.
+
+use thiserror::Error;
+use ndarray::Array3;
 use ruid_camera::{VideoFrame, FrameBacking};
 use resize::{new, Pixel, Type};
 use rgb::FromSlice;
+
+#[derive(Error, Debug)]
+pub enum PreprocessError {
+    #[error("GPU path not yet implemented; build with --features gpu")]
+    GpuNotImplemented,
+    #[error("OpenCL kernel not yet implemented")]
+    GpuUnimplemented,
+    #[error("Failed to create resizer: {0}")]
+    ResizeError(String),
+    #[error("Invalid ndarray buffer")]
+    NdArrayBufferError,
+}
+
+pub type Result<T> = std::result::Result<T, PreprocessError>;
 
 #[derive(Clone)]
 pub struct Preprocessor {
@@ -24,7 +64,7 @@ impl Preprocessor {
         let nv12 = match &frame.backing {
             FrameBacking::Cpu(bytes) => bytes.as_slice(),
             FrameBacking::DmaBuf(_fd) => {
-                return Err(anyhow!("GPU path not yet implemented; build with --features gpu"));
+                return Err(PreprocessError::GpuNotImplemented);
             }
         };
 
@@ -43,13 +83,14 @@ impl Preprocessor {
 
         // Create a reusable resizer instance:
         let mut resizer = new(
-            w, 
+            w,
             h,
             self.dst_w as usize,
             self.dst_h as usize,
             Pixel::RGB8,
             Type::Lanczos3,
-        )?;
+        )
+        .map_err(|e| PreprocessError::ResizeError(e.to_string()))?;
 
         // Now invoke it on your raw byte buffers:
         let _ = resizer.resize(
@@ -61,8 +102,8 @@ impl Preprocessor {
         let mut arr = Array3::<f32>::zeros((self.dst_h as usize,
                                             self.dst_w as usize,
                                             3));
-        for (idx, px) in dst.iter().enumerate() {
-            arr.as_slice_mut().unwrap()[idx] = *px as f32 / 255.0;
+        for (out_elem, px) in arr.iter_mut().zip(dst.iter()) {
+            *out_elem = *px as f32 / 255.0;
         }
         Ok(arr)
     }
