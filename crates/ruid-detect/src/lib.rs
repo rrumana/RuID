@@ -1,4 +1,4 @@
-// ruid-preprocess/src/lib.rs
+// ruid-detect/src/lib.rs
 // ============================================================
 // ruid-detect  –  Object-detection stage for RuID v2
 // Runs a static-quantised **YOLOv8-nano INT8** network via
@@ -30,8 +30,48 @@
 
 use ndarray::Array3;
 use tract_onnx::prelude::*;
-use tract_ndarray::{Array4, Axis};
+use tract_ndarray::{Array4, Axis, s};
 use thiserror::Error;
+
+const INPUT_SIZE: f32 = 224.0;          // we exported 224×224
+const STRIDES: [i32; 3] = [8, 16, 32];  // for 224×224 input
+const CONF_THR:   f32 = 0.05;           // a bit higher now
+
+// ------------------------------------------------------------
+// helpers: sigmoid • IoU • NMS
+// ------------------------------------------------------------
+fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
+
+fn iou(a: &[f32;4], b: &[f32;4]) -> f32 {
+    let ix1 = a[0].max(b[0]);
+    let iy1 = a[1].max(b[1]);
+    let ix2 = a[2].min(b[2]);
+    let iy2 = a[3].min(b[3]);
+    let iw  = (ix2 - ix1).max(0.0);
+    let ih  = (iy2 - iy1).max(0.0);
+    let inter = iw * ih;
+    let area_a = (a[2]-a[0]) * (a[3]-a[1]);
+    let area_b = (b[2]-b[0]) * (b[3]-b[1]);
+    inter / (area_a + area_b - inter + 1e-6)
+}
+
+fn non_max_suppression(dets: Vec<Detection>, iou_thr: f32) -> Vec<Detection> {
+    let mut dets = dets;
+    dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    let mut keep: Vec<Detection> = Vec::with_capacity(dets.len());
+
+    'outer: for d in dets {
+        for k in &keep {
+            if iou(&d.bbox, &k.bbox) > iou_thr {
+                continue 'outer;
+            }
+        }
+        keep.push(d);
+        if keep.len() >= 300 { break }
+    }
+    keep
+}
 
 #[derive(Debug, Error)]
 pub enum DetectError {
@@ -68,7 +108,7 @@ impl TractYolo {
     pub fn new(model_path: &str) -> Result<Self> {
         let model = tract_onnx::onnx()
             .model_for_path(model_path)?
-            .with_input_fact(0, InferenceFact::dt_shape(i8::datum_type(), tvec![1,3,224,224]))?
+            .with_input_fact(0, InferenceFact::dt_shape(f32::datum_type(), tvec![1,3,224,224]))?
             .into_optimized()?
             .into_runnable()?;          
 
@@ -89,8 +129,8 @@ impl Detector for TractYolo {
         let mut arr4 = Array4::<f32>::zeros((1, 3, h, w));
         for y in 0..h {
             for x in 0..w {
-               for ch in 0..3 {
-                    arr4[(0,ch,y,x)] = input[(y,x,ch)];
+                for ch in 0..3 {
+                    arr4[(0, ch, y, x)] = input[(y, x, ch)];
                 }
             }
         }
@@ -101,38 +141,60 @@ impl Detector for TractYolo {
 
         // 3) Run the model
         let outputs = self.model.run(inputs)?;
-        let output = &outputs[0];
+        let view    = outputs[0].to_array_view::<f32>()?;
+        let view    = view.index_axis(Axis(0), 0);          // [84, 1029]
 
-        // 4) Get a tract-ndarray ArrayViewD<f32>; shape should be [1, N, 6]
-        let view = output.to_array_view::<f32>()?;   
+        eprintln!("output shape {:?}", view.shape());
 
-        let shape = view.shape();
-        let shape_vec = view.shape().to_vec();
-        if !(shape_vec.len() == 3 && shape_vec[0] == 1 && shape_vec[2] == 6) {
-            return Err(DetectError::InvalidOutputShape(shape_vec));
+        let mut dets = Vec::new();
+        let mut anchor_ofs = 0;
+        // walk the three detection layers
+        for (s_i, &stride) in STRIDES.iter().enumerate() {
+            let g = (INPUT_SIZE as i32 / stride) as usize;      // grid size
+            for gy in 0..g {
+                for gx in 0..g {
+                    let anchor = anchor_ofs + gy * g + gx;
+
+                    // -------- raw predictions ----------
+                    let x  = view[[0, anchor]];
+                    let y  = view[[1, anchor]];
+                    let w  = view[[2, anchor]];
+                    let h  = view[[3, anchor]];
+                    let obj_logit = view[[4, anchor]];
+
+                    // -------- decode centre + size -----
+                    let bx = (sigmoid(x) * 2.0 - 0.5 + gx as f32) * stride as f32;
+                    let by = (sigmoid(y) * 2.0 - 0.5 + gy as f32) * stride as f32;
+                    let bw = (sigmoid(w) * 2.0).powi(2) * stride as f32;
+                    let bh = (sigmoid(h) * 2.0).powi(2) * stride as f32;
+
+                    // -------- best class ---------------
+                    let cls_slice = view.slice(s![5.., anchor]);
+                    let (best_cls, &cls_logit) = cls_slice
+                        .iter()
+                        .enumerate()
+                        .max_by(|a,b| a.1.partial_cmp(b.1).unwrap())
+                        .unwrap();
+                    let conf = sigmoid(obj_logit) * sigmoid(cls_logit);
+
+                    if conf >= CONF_THR && best_cls == 0 {      // keep only “person”
+                        dets.push(Detection {
+                            bbox: [
+                                (bx - bw/2.0) / INPUT_SIZE,      // x1,y1,x2,y2  normalised 0-1
+                                (by - bh/2.0) / INPUT_SIZE,
+                                (bx + bw/2.0) / INPUT_SIZE,
+                                (by + bh/2.0) / INPUT_SIZE,
+                            ],
+                            score: conf,
+                            class: best_cls,
+                        });
+                    }
+                }
+            }
+            anchor_ofs += g * g;
         }
-        let n = shape[1];
 
-        // 5) Pull out each detection row
-        let mut dets = Vec::with_capacity(n);
-        for i in 0..n {
-            // index_axis over axis=1 gives a 1×6 view
-            let row = view.index_axis(Axis(1), i);  
-
-            let xc    = row[0];
-            let yc    = row[1];
-            let wbox  = row[2];
-            let hbox  = row[3];
-            let score = row[4];
-            let class = row[5] as usize;
-
-            dets.push( Detection {
-                bbox:  [xc - wbox/2.0, yc - hbox/2.0, xc + wbox/2.0, yc + hbox/2.0],
-                score,
-                class,
-            });
-        }
-
-        Ok(dets)
+        // 4. NMS exactly as before
+        Ok(non_max_suppression(dets, 0.05))
     }
 }

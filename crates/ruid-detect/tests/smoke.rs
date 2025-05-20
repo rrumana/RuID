@@ -3,7 +3,7 @@ use ruid_detect::{TractYolo, Detector};
 #[test]
 fn yolo_smoke() -> anyhow::Result<()> {
     let manifest = std::env::var("CARGO_MANIFEST_DIR")?;
-    let default = format!("{}/../../models/yolov8n_int8.onnx", manifest);
+    let default = format!("{}/../../models/yolo11n_int8.onnx", manifest);
     let model = std::env::var("YOLO_MODEL").unwrap_or(default);
     let det = TractYolo::new(&model)?;
 

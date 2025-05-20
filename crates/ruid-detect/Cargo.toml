@@ -5,12 +5,17 @@ edition  = "2021"
 authors  = ["Ryan Rumana <ryan.rumana@gmail.com>"]
 resolver = "2"
 
+[features]
+default = []
+opencv = ["dep:opencv"]
+
 [dependencies]
 anyhow           = "1.0"
 ndarray          = "0.15"
 tract-onnx       = "0.21.13"
 tract-core       = "0.21.13"
 thiserror        = "1.0"
+opencv = { version = "0.94.1", optional = true }
 
 # reuse your preprocess crate’s tensor type
 ruid-preprocess  = { path = "../ruid-preprocess" }
