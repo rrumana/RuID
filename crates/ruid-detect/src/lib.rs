@@ -1,48 +1,52 @@
 // ruid-detect/src/lib.rs
 // ============================================================
-// ruid-detect  –  Object-detection stage for RuID v2
-// Runs a static-quantised **YOLOv8-nano INT8** network via
-// Tract (pure-Rust) or OnnxRuntime (optional feature).
+// ruid-detect – Object-detection stage for RuID v2
+// Runs a YOLO v11-nano FP32 model with ONNX-Runtime 2.
 // ------------------------------------------------------------
-// Pipeline: Array3<f32> → Tensor → Vec<Detection>
+// Pipeline: Array3<f32> (HWC, range 0–1) → ONNX → Vec<Detection>
 // ------------------------------------------------------------
 // Public API
-//   * TractYolo::new(path)      – load & optimise ONNX
-//   * Detector::detect(arr3)    – returns Vec<Detection>
-//     where Detection { bbox, score, class }
+// * OrtYolo::new(path) – load & optimise ONNX
+// * Detector::detect(img) – returns Vec<Detection>
+// where Detection { bbox, score } (bbox normalised 0–1)
 // ------------------------------------------------------------
-//   Build notes
-//     * Default backend = Tract 0.17 (no C deps, works on Pi).
-//     * `--features ort` switches to onnxruntime-sys if desired. (someday)
+// Build notes
+// * Default backend = onnxruntime-sys 2.0 (multithreaded, no Cuda).
+// * Pure-Rust Tract backend kept as a feature tract (optional).
 // ============================================================
-
 //! RuID – detection layer
 //!
-//! This crate provides a backend-agnostic [`Detector`] trait plus a
-//! concrete **`TractYolo`** implementation that runs an INT8 YOLOv8-nano
-//! model. In the future Switching to onnxruntime or another engine is a 
-//! matter of enabling a Cargo feature – the outer API stays identical.
+//! This crate exposes a backend-agnostic [Detector] trait plus the
+//! concrete OrtYolo implementation that runs a YOLO v11-nano
+//! network via ONNX-Runtime 2.0. Switching to Tract or another engine
+//! is only a Cargo-feature flip – the outer API remains identical.
 //!
-//! Input tensors come from `ruid-preprocess` (CHW, f32).  Output is a
-//! vector of [`Detection`] structs containing normalised corner boxes,
-//! confidence and class index.  No copies are made inside the hot path –
-//! Tract reads directly from the tensor memory we allocate once per frame.
+//! The detector expects pre-processed input tensors coming from
+//! ruid-preprocess (HWC, f32, normalised to 0-1). The hot path is
+//! zero-copy: we create one tensor per frame and let ORT read it
+//! directly; no additional allocations are performed.
 
-use ndarray::Array3;
-use tract_onnx::prelude::*;
-use tract_ndarray::{Array4, Axis, s};
+use ndarray::{s, Array3, Array4, Axis};
+use ort::{
+    inputs,
+    session::{builder::GraphOptimizationLevel, Session, SessionOutputs},
+    value::TensorRef,
+    Error as OrtError,
+};
 use thiserror::Error;
+use num_cpus;
 
-const INPUT_SIZE: f32 = 224.0;          // we exported 224×224
-const STRIDES: [i32; 3] = [8, 16, 32];  // for 224×224 input
-const CONF_THR:   f32 = 0.05;           // a bit higher now
+// ───── constants ────────────────────────────────────────────
+const IN_W: usize = 640;
+const IN_H: usize = 480;
+const CONF_THR: f32 = 0.50;
+const NMS_IOU: f32 = 0.45;
+const PERSON_CLASS: usize = 0;        // COCO class id
 
-// ------------------------------------------------------------
-// helpers: sigmoid • IoU • NMS
-// ------------------------------------------------------------
-fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
+// ───── helpers ──────────────────────────────────────────────
 
-fn iou(a: &[f32;4], b: &[f32;4]) -> f32 {
+#[inline]
+fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let ix1 = a[0].max(b[0]);
     let iy1 = a[1].max(b[1]);
     let ix2 = a[2].min(b[2]);
@@ -55,146 +59,99 @@ fn iou(a: &[f32;4], b: &[f32;4]) -> f32 {
     inter / (area_a + area_b - inter + 1e-6)
 }
 
-fn non_max_suppression(dets: Vec<Detection>, iou_thr: f32) -> Vec<Detection> {
-    let mut dets = dets;
-    dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-
-    let mut keep: Vec<Detection> = Vec::with_capacity(dets.len());
-
-    'outer: for d in dets {
+fn nms(mut v: Vec<Detection>) -> Vec<Detection> {
+    v.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut keep: Vec<Detection> = Vec::with_capacity(v.len());
+    'outer: for d in v {
         for k in &keep {
-            if iou(&d.bbox, &k.bbox) > iou_thr {
-                continue 'outer;
-            }
+            if iou(&d.bbox, &k.bbox) > NMS_IOU { continue 'outer }
         }
         keep.push(d);
-        if keep.len() >= 300 { break }
     }
     keep
 }
 
+// ───── public types ────────────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct Detection {
+    pub bbox : [f32; 4],          // x1 y1 x2 y2  (0-1)
+    pub score: f32,
+}
+
 #[derive(Debug, Error)]
 pub enum DetectError {
-    #[error("Model load or inference error: {0}")]
-    Tract(#[from] TractError),
-    #[error("Invalid input channels: expected 3, got {0}")]
-    InvalidChannels(usize),
-    #[error("Invalid output shape: expected [1, N, 6], got {0:?}")]
-    InvalidOutputShape(Vec<usize>),
+    #[error("ORT error: {0}")]
+    Ort(#[from] OrtError),
+    #[error("expect 640×640×3, got shape {0:?}")]
+    BadShape(Vec<usize>),
 }
+pub type Result<T> = core::result::Result<T, DetectError>;
 
-pub type Result<T> = std::result::Result<T, DetectError>;
+pub trait Detector { fn detect(&mut self, img:&Array3<f32>) -> Result<Vec<Detection>>; }
 
-/// A single detection: bounding box [x1,y1,x2,y2] in normalized coords plus score.
-#[derive(Debug)]
-pub struct Detection {
-    pub bbox:  [f32; 4],
-    pub score: f32,
-    pub class: usize,
-}
+// ───── ORT implementation ──────────────────────────────────
+pub struct OrtYolo { session: Session }
 
-/// Trait for object detectors.
-pub trait Detector {
-    fn detect(&self, input: &Array3<f32>) -> Result<Vec<Detection>>;
-}
-
-/// Tract-powered YOLOv8-Nano INT8 detector.
-pub struct TractYolo {
-    model: RunnableModel<TypedFact, Box<dyn TypedOp>, TypedModel>,
-}
-
-impl TractYolo {
-    /// Load and optimize the ONNX model, preparing it for inference.
-    pub fn new(model_path: &str) -> Result<Self> {
-        let model = tract_onnx::onnx()
-            .model_for_path(model_path)?
-            .with_input_fact(0, InferenceFact::dt_shape(f32::datum_type(), tvec![1,3,224,224]))?
-            .into_optimized()?
-            .into_runnable()?;          
-
-        Ok(Self { model })
+impl OrtYolo {
+    pub fn new<P: AsRef<std::path::Path>>(model:P) -> Result<Self> {
+        Ok(Self { session: Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(num_cpus::get_physical()-1)?
+                .commit_from_file(model)? 
+            })
     }
 }
 
-impl Detector for TractYolo {
-    fn detect(&self, input: &Array3<f32>) -> Result<Vec<Detection>> {
-        let h = input.shape()[0];
-        let w = input.shape()[1];
-        let c = input.shape()[2];
-        if c != 3 {
-            return Err(DetectError::InvalidChannels(c));
+impl Detector for OrtYolo {
+    fn detect(&mut self, img:&Array3<f32>) -> Result<Vec<Detection>> {
+        if img.shape() != &[IN_H, IN_W, 3] {
+            return Err(DetectError::BadShape(img.shape().to_vec()))
         }
 
-        // 1) Build a tract_ndarray::Array4 of shape [1,3,H,W]
-        let mut arr4 = Array4::<f32>::zeros((1, 3, h, w));
-        for y in 0..h {
-            for x in 0..w {
-                for ch in 0..3 {
-                    arr4[(0, ch, y, x)] = input[(y, x, ch)];
-                }
+        // ---- HWC ➜ NCHW ---------------------------------------------------
+        let mut chw = Array4::<f32>::zeros((1, 3, IN_H, IN_W));
+        for y in 0..IN_H { for x in 0..IN_W {
+            let p = img.slice(s![y, x, ..]);
+            chw[[0, 0, y, x]] = p[0];
+            chw[[0, 1, y, x]] = p[1];
+            chw[[0, 2, y, x]] = p[2];
+        }}
+
+        let input = TensorRef::from_array_view(chw.view())?;
+        let outputs: SessionOutputs = self.session.run(inputs!["input" => input])?;
+        let output = outputs["output"].try_extract_array::<f32>()?.t().into_owned();
+
+        let mut dets = Vec::with_capacity(output.shape()[1]);
+
+        let output = output.slice(s![.., .., 0]);
+        for row in output.axis_iter(Axis(0)) {
+            let row: Vec<_> = row.iter().copied().collect();
+            let (class_id, prob) = row
+                .iter()
+                .skip(4)
+                .enumerate()
+                .map(|(index, value)| (index, *value))
+                .reduce(|accum, row| if row.1 > accum.1 { row } else { accum })
+                .unwrap();
+            if prob < CONF_THR || class_id != PERSON_CLASS {
+                continue;
             }
+            let xc = row[0] / IN_W as f32 * (IN_W as f32);
+            let yc = row[1] / IN_H as f32 * (IN_H as f32);
+            let w = row[2] / IN_W as f32 * (IN_W as f32);
+            let h = row[3] / IN_H as f32 * (IN_H as f32);
+
+            dets.push(Detection {
+                bbox: [
+                    (xc - w * 0.5) / IN_W as f32,
+                    (yc - h * 0.5) / IN_H as f32,
+                    (xc + w * 0.5) / IN_W as f32,
+                    (yc + h * 0.5) / IN_H as f32,
+                ],
+                score: prob,
+            });
         }
 
-        // 2) Into a tract Tensor, then into a TValue for the tvec! macro
-        let tensor: Tensor = arr4.into_tensor();
-        let inputs: TVec<TValue> = tvec![tensor.into()];
-
-        // 3) Run the model
-        let outputs = self.model.run(inputs)?;
-        let view    = outputs[0].to_array_view::<f32>()?;
-        let view    = view.index_axis(Axis(0), 0);          // [84, 1029]
-
-        eprintln!("output shape {:?}", view.shape());
-
-        let mut dets = Vec::new();
-        let mut anchor_ofs = 0;
-        // walk the three detection layers
-        for (s_i, &stride) in STRIDES.iter().enumerate() {
-            let g = (INPUT_SIZE as i32 / stride) as usize;      // grid size
-            for gy in 0..g {
-                for gx in 0..g {
-                    let anchor = anchor_ofs + gy * g + gx;
-
-                    // -------- raw predictions ----------
-                    let x  = view[[0, anchor]];
-                    let y  = view[[1, anchor]];
-                    let w  = view[[2, anchor]];
-                    let h  = view[[3, anchor]];
-                    let obj_logit = view[[4, anchor]];
-
-                    // -------- decode centre + size -----
-                    let bx = (sigmoid(x) * 2.0 - 0.5 + gx as f32) * stride as f32;
-                    let by = (sigmoid(y) * 2.0 - 0.5 + gy as f32) * stride as f32;
-                    let bw = (sigmoid(w) * 2.0).powi(2) * stride as f32;
-                    let bh = (sigmoid(h) * 2.0).powi(2) * stride as f32;
-
-                    // -------- best class ---------------
-                    let cls_slice = view.slice(s![5.., anchor]);
-                    let (best_cls, &cls_logit) = cls_slice
-                        .iter()
-                        .enumerate()
-                        .max_by(|a,b| a.1.partial_cmp(b.1).unwrap())
-                        .unwrap();
-                    let conf = sigmoid(obj_logit) * sigmoid(cls_logit);
-
-                    if conf >= CONF_THR && best_cls == 0 {      // keep only “person”
-                        dets.push(Detection {
-                            bbox: [
-                                (bx - bw/2.0) / INPUT_SIZE,      // x1,y1,x2,y2  normalised 0-1
-                                (by - bh/2.0) / INPUT_SIZE,
-                                (bx + bw/2.0) / INPUT_SIZE,
-                                (by + bh/2.0) / INPUT_SIZE,
-                            ],
-                            score: conf,
-                            class: best_cls,
-                        });
-                    }
-                }
-            }
-            anchor_ofs += g * g;
-        }
-
-        // 4. NMS exactly as before
-        Ok(non_max_suppression(dets, 0.05))
+        Ok(nms(dets))
     }
 }

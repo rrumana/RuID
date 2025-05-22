@@ -7,15 +7,15 @@ resolver = "2"
 
 [features]
 default = []
-opencv = ["dep:opencv"]
 
 [dependencies]
-anyhow           = "1.0"
-ndarray          = "0.15"
-tract-onnx       = "0.21.13"
-tract-core       = "0.21.13"
-thiserror        = "1.0"
-opencv = { version = "0.94.1", optional = true }
+ort       = { git = "https://github.com/pykeio/ort.git", default-features = false, features = ["std", "download-binaries", "ndarray"] }
+ndarray   = { version = "0.16", features = ["serde"] }   # -> ort’s ndarray API uses 0.15
+thiserror = "1.0"
+opencv    = { version = "0.94"}   # camera preview
+anyhow    = { version = "1"}
+num_cpus = "1.16.0"
 
 # reuse your preprocess crate’s tensor type
 ruid-preprocess  = { path = "../ruid-preprocess" }
+
