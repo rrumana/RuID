@@ -1,12 +1,15 @@
 [workspace]
 members = [
-    "crates/ruid-camera", "crates/ruid-detect",
-    "crates/ruid-preprocess",
-    "crates/ruid-detect"
+    "crates/ruid-camera", 
+    "crates/ruid-detect",
+    "crates/ruid-preprocess", 
+    "crates/ruid-model",
+    "examples",
     ]
 resolver = "2"
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = true
+strip = true
 codegen-units = 1
-panic = "abort"

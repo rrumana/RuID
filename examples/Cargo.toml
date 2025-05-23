@@ -1,0 +1,23 @@
+[package]
+name = "examples"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dynamic_dimensions_demo"
+path = "dynamic_dimensions_demo.rs"
+
+[[bin]]
+name = "full_pipeline_demo"
+path = "full_pipeline_demo.rs"
+
+[dependencies]
+anyhow = "1.0"
+ruid-camera = { path = "../crates/ruid-camera" }
+ruid-preprocess = { path = "../crates/ruid-preprocess" }
+ruid-detect = { path = "../crates/ruid-detect" }
+ruid-model = { path = "../crates/ruid-model" }
+opencv = "0.94"
+ndarray = "0.16"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1"

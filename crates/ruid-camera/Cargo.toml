@@ -18,6 +18,7 @@ libc = "0.2.172"
 
 [dev-dependencies]
 serial_test = "2"
+opencv = { version = "0.94.1", default-features = false, features = ["imgproc", "highgui", "videoio"] }
 
 #link to ruid‑preprocess via relative path
 ruid-preprocess = { path = "../ruid-preprocess" }

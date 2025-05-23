@@ -110,10 +110,7 @@ impl Camera {
 
         let pipe_str = format!(
             "{src} ! videoconvert ! video/x-raw,format=NV12,width={w},height={h},framerate={f}/1 \
-            ! queue leaky=2 max-size-buffers=8 ! tee name=t \
-            t. ! queue leaky=2 max-size-buffers=1 ! videoconvert ! autovideosink sync=false \
-            t. ! queue leaky=2 max-size-buffers=8 ! appsink name=sink emit-signals=true \
-            sync=false",
+            ! queue leaky=2 max-size-buffers=8 ! appsink name=sink emit-signals=true sync=false",
             src = src, w = width, h = height, f = fps
         );
 

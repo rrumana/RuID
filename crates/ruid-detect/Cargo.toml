@@ -10,12 +10,15 @@ default = []
 
 [dependencies]
 ort       = { git = "https://github.com/pykeio/ort.git", default-features = false, features = ["std", "download-binaries", "ndarray"] }
-ndarray   = { version = "0.16", features = ["serde"] }   # -> ort’s ndarray API uses 0.15
+ndarray   = { version = "0.16", features = ["serde"] }
 thiserror = "1.0"
 opencv    = { version = "0.94"}   # camera preview
 anyhow    = { version = "1"}
 num_cpus = "1.16.0"
+tokio     = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# reuse your preprocess crate’s tensor type
+# reuse your preprocess crate's tensor type
 ruid-preprocess  = { path = "../ruid-preprocess" }
+ruid-model       = { path = "../ruid-model" }
+ruid-camera      = { path = "../ruid-camera" }
 

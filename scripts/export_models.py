@@ -32,7 +32,7 @@ MODELS_DIR.mkdir(exist_ok=True)
 class RandomCalibrationReader(CalibrationDataReader):
     """Feeds a single random tensor into quantize_static as calibration data."""
 
-    def __init__(self, input_name: str, shape=(1, 3, 224, 224)):
+    def __init__(self, input_name: str, shape=(1, 3, 640, 640)):
         self.input_name = input_name
         self.shape      = shape
         self._done      = False
@@ -54,7 +54,7 @@ def find_and_export_yolo11() -> pathlib.Path:
             "export",
             "model=yolo11n.pt",
             "format=onnx",
-            "imgsz=224",
+            "imgsz=640x480",
             "simplify=True",
         ],
         check=True,

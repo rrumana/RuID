@@ -1,0 +1,36 @@
+[package]
+name     = "ruid-model"
+version  = "0.1.0"
+edition  = "2021"
+authors  = ["Ryan Rumana <ryan.rumana@gmail.com>"]
+resolver = "2"
+description = "RuID model export and quantization wrapper around ultralytics and onnxruntime"
+
+[features]
+default = []
+
+[dependencies]
+# ONNX Runtime for quantization and model operations
+ort = { git = "https://github.com/pykeio/ort.git", default-features = false, features = ["std", "download-binaries", "ndarray"] }
+ndarray = { version = "0.16", features = ["serde"] }
+
+# Error handling and utilities
+thiserror = "1.0"
+anyhow = "1.0"
+
+# File system and path operations
+tempfile = "3.8"
+glob = "0.3"
+
+# Process execution for calling ultralytics CLI
+tokio = { version = "1.0", features = ["process", "rt", "macros", "fs", "rt-multi-thread"] }
+
+# Serialization for configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Random number generation for calibration data
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
