@@ -18,7 +18,8 @@ Full design: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 | --------------------------- | --------------------------------------------------------------- |
 | `crates/ruid-camera`        | GStreamer/libcamera capture → `Stream<DmaBufFrame>`             |
 | `crates/ruid-preprocess`    | Resize + normalize kernels (OpenCL & NEON; CPU fallback)        |
-| `crates/ruid-detect`        | YOLOv8-nano INT8 inference (Tract backend)                      |
+| `crates/ruid-models`        | Ultralytics/Torch based model download & export                 |
+| `crates/ruid-detect`        | YOLOv11-nano INT8 inference (Tract backend)                      |
 | `crates/ruid-reid`          | ResNet-50 (IBN) embeddings for Re-ID                            |
 | `crates/ruid-track`         | BYTE-Track multi-object tracker (pure Rust)                     |
 | `edge-client/`              | CLI binary tying all edge crates together                       |
