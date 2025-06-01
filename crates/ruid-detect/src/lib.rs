@@ -114,7 +114,7 @@ impl OrtYolo {
         Ok(Self {
             session: Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(num_cpus::get_physical()-1)?
+                .with_intra_threads(1)?
                 .commit_from_file(model)?,
             input_width: input_width as usize,
             input_height: input_height as usize,

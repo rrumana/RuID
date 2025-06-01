@@ -29,10 +29,10 @@ use tokio_stream::StreamExt;
 // Pipeline configuration constants
 const CAMERA_WIDTH: u32 = 640;
 const CAMERA_HEIGHT: u32 = 480;
-const TENSOR_WIDTH: u32 = 224;
-const TENSOR_HEIGHT: u32 = 224;
+const TENSOR_WIDTH: u32 = 640;
+const TENSOR_HEIGHT: u32 = 640;
 const CAMERA_FPS: u32 = 30;
-const FPS_WINDOW_SIZE: usize = 30;
+const FPS_WINDOW_SIZE: usize = 60;
 
 /// FPS calculation helper
 fn calculate_fps(window: &VecDeque<Instant>) -> f64 {
@@ -48,14 +48,14 @@ async fn setup_model() -> Result<PathBuf> {
     println!("🔧 Setting up YOLO11 model for {}×{} input...", TENSOR_WIDTH, TENSOR_HEIGHT);
     
     let config = ModelConfig {
-        output_dir: PathBuf::from("./models/pipeline_demo"),
+        output_dir: PathBuf::from("./models/"),
         image_size: (TENSOR_HEIGHT, TENSOR_WIDTH), // Note: height, width order
-        quantize: false, // Use FP32 for better compatibility
+        quantize: true, // Use FP32 for better compatibility
         batch_size: 1,
     };
 
     // Check if model already exists
-    let model_path = config.output_dir.join("yolo11n_fp32.onnx");
+    let model_path = config.output_dir.join("yolo11n_int8.onnx");
     if model_path.exists() {
         println!("✅ Found existing model at: {:?}", model_path);
         return Ok(model_path);

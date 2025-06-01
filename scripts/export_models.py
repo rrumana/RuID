@@ -54,7 +54,7 @@ def find_and_export_yolo11() -> pathlib.Path:
             "export",
             "model=yolo11n.pt",
             "format=onnx",
-            "imgsz=640x480",
+            "imgsz=640",
             "simplify=True",
         ],
         check=True,
@@ -85,7 +85,7 @@ def quantise_static(
     in_model: pathlib.Path,
     out_name: str,
     input_name: str,
-    calib_shape=(1, 3, 224, 224),
+    calib_shape=(1, 3, 640, 640),
 ):
     out_model = MODELS_DIR / out_name
     print(f"▶ Static-quantising {in_model.name} → {out_model.name}")
@@ -96,11 +96,11 @@ def quantise_static(
         model_input=str(in_model),
         model_output=str(out_model),
         calibration_data_reader=reader,
-        quant_format=QuantFormat.QOperator,  # fully fused INT8 ops
+        quant_format=QuantFormat.QDQ,  # fully fused INT8 ops
         activation_type=QuantType.QInt8,
         weight_type=QuantType.QInt8,
         calibrate_method=CalibrationMethod.MinMax,
-        op_types_to_quantize=["Conv", "MatMul"],  # ← keep Sigmoid FP32
+        op_types_to_quantize=["Conv", "MatMul", "Add"],  # ← keep Sigmoid FP32
     )
     return out_model
 
